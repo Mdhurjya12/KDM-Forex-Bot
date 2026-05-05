@@ -1,12 +1,14 @@
 # main.py
-# KDM Trading System — Multi-Asset Bot with Execution
+# KDM Trading System — Multi-Asset Bot with VWAP + Order Block
+# Sound alerts included — no need to watch screen all day
 
 import sys
 import time
+import subprocess
 import ccxt
 import pandas as pd
 from datetime import datetime
-from strategy import add_ema, generate_signal, label_candles
+from strategy import add_ema, generate_signal, label_candles, detect_order_blocks, detect_fractal_sweep, detect_cisd
 from ai_filter import ai_filter
 from executor import open_trade, check_trade, get_stats, init_trade_log
 
@@ -46,12 +48,19 @@ ASSETS = {
     },
 }
 
-# ── SWITCH ASSET FROM TERMINAL ────────────────────
-# Usage:
-#   python3 main.py          ← defaults to BTC
-#   python3 main.py GOLD
-#   python3 main.py NASDAQ
+# =========================
+# SESSION FILTER
+# Set to True  → only signals during market hours
+# Set to False → signals 24/7 (good for testing)
+# =========================
+USE_SESSION_FILTER = False    # ← change to True for live prop trading
 
+# =========================
+# SWITCH ASSET FROM TERMINAL
+# python3 main.py          ← BTC
+# python3 main.py GOLD     ← Gold
+# python3 main.py NASDAQ   ← Nasdaq
+# =========================
 if len(sys.argv) > 1:
     arg = sys.argv[1].upper()
     if arg in ASSETS:
@@ -71,6 +80,20 @@ SL_PCT       = CONFIG["sl_pct"]
 DATA_FILE    = CONFIG["data_file"]
 CANDLE_LIMIT = 100
 LOOKAHEAD    = 40
+
+# =========================
+# SOUND ALERT
+# Plays Mac system sound when signal fires
+# =========================
+def send_alert(message, sound="Glass"):
+    print(f"\n🔔  ALERT: {message}\n")
+    try:
+        subprocess.run(
+            ["afplay", f"/System/Library/Sounds/{sound}.aiff"],
+            timeout=3
+        )
+    except Exception:
+        pass   # silent fail if sound not available
 
 # =========================
 # EXCHANGE SETUP
@@ -138,10 +161,12 @@ except FileNotFoundError:
     ).to_csv(DATA_FILE, index=False)
     print(f"📂 Created new data file: {DATA_FILE}")
 
-print(f"\n{'='*50}")
+print(f"\n{'='*55}")
 print(f"  KDM Bot — {ACTIVE_ASSET} ({SYMBOL})")
-print(f"  TP: {TP_PCT*100}%  SL: {SL_PCT*100}%  Lookahead: {LOOKAHEAD}")
-print(f"{'='*50}\n")
+print(f"  TP: {TP_PCT*100}%  |  SL: {SL_PCT*100}%  |  Lookahead: {LOOKAHEAD}")
+print(f"  Session Filter: {'ON' if USE_SESSION_FILTER else 'OFF (testing mode)'}")
+print(f"  Strategy: VWAP + Order Block + ICT")
+print(f"{'='*55}\n")
 
 # =========================
 # MAIN LOOP
@@ -157,9 +182,17 @@ while True:
             continue
 
         # ── INDICATORS ────────────────────────────────────
-        df = add_ema(df)
+        df = add_ema(df)                          # adds VWAP + EMA + RSI
         df["ema_distance"] = df["ema9"] - df["ema15"]
         df["volatility"]   = df["close"].rolling(10).std()
+
+        # ── ICT PATTERNS ──────────────────────────────────
+        try:
+            df = detect_order_blocks(df, impulse_candles=3)
+            df = detect_fractal_sweep(df, lookback=10)
+            df = detect_cisd(df)
+        except Exception as e:
+            pass   # continue without ICT if it fails
 
         # ── SMART LABELING ────────────────────────────────
         df = label_candles(df, tp_pct=TP_PCT, sl_pct=SL_PCT, lookahead=LOOKAHEAD)
@@ -173,24 +206,29 @@ while True:
             continue
 
         # ── SIGNAL ────────────────────────────────────────
-        signal = generate_signal(df, asset=ACTIVE_ASSET)
-        last   = df.iloc[-1]
+        signal = generate_signal(
+            df,
+            asset              = ACTIVE_ASSET,
+            use_session_filter = USE_SESSION_FILTER
+        )
 
+        last     = df.iloc[-1]
         ema_dist = float(last["ema_distance"])
         vol      = float(last["volatility"])
         label    = int(last["label"])
+        price    = float(last["close"])
+        vwap     = float(last["vwap"]) if "vwap" in df.columns else 0
 
         # ── CHECK OPEN TRADE ──────────────────────────────
-        # Always check first if an existing trade hit TP or SL
         check_trade(
             current_high  = float(last["high"]),
             current_low   = float(last["low"]),
-            current_price = float(last["close"]),
+            current_price = price,
             asset         = ACTIVE_ASSET
         )
 
         # ── AI FILTER + EXECUTION ─────────────────────────
-        if signal == "BUY":
+        if signal in ["BUY", "SELL"]:
             allow, prob = ai_filter(
                 ema9         = float(last["ema9"]),
                 ema15        = float(last["ema15"]),
@@ -200,51 +238,43 @@ while True:
             )
 
             if allow:
-                print(f"✅  TRADE APPROVED — {ACTIVE_ASSET} | confidence: {prob:.0%}")
-                open_trade(
+                # 🔔 Sound alert — your Mac will make a sound
+                send_alert(
+                    f"{signal} {ACTIVE_ASSET} @ {price:,.2f} | AI: {prob:.0%}",
+                    sound="Glass" if signal == "BUY" else "Basso"
+                )
+
+                opened, reason = open_trade(
                     asset  = ACTIVE_ASSET,
-                    signal = "BUY",
-                    price  = float(last["close"]),
+                    signal = signal,
+                    price  = price,
                     tp_pct = TP_PCT,
                     sl_pct = SL_PCT,
                     prob   = prob
                 )
-            else:
-                print(f"🚫  TRADE BLOCKED  — {ACTIVE_ASSET} | confidence: {prob:.0%}")
 
-        elif signal == "SELL":
-            allow, prob = ai_filter(
-                ema9         = float(last["ema9"]),
-                ema15        = float(last["ema15"]),
-                ema_distance = ema_dist,
-                volatility   = vol,
-                asset        = ACTIVE_ASSET
-            )
-
-            if allow:
-                print(f"✅  SELL APPROVED  — {ACTIVE_ASSET} | confidence: {prob:.0%}")
-                open_trade(
-                    asset  = ACTIVE_ASSET,
-                    signal = "SELL",
-                    price  = float(last["close"]),
-                    tp_pct = TP_PCT,
-                    sl_pct = SL_PCT,
-                    prob   = prob
-                )
+                if not opened:
+                    print(f"⏸️  Trade not opened: {reason}")
             else:
-                print(f"🚫  SELL BLOCKED   — {ACTIVE_ASSET} | confidence: {prob:.0%}")
+                print(f"🚫  {signal} BLOCKED — {ACTIVE_ASSET} | AI confidence too low: {prob:.0%}")
 
         # ── DISPLAY ───────────────────────────────────────
-        stats = get_stats()
+        stats      = get_stats()
+        vwap_side  = "ABOVE" if price > vwap else "BELOW"
+        ob_bull    = "🟢 IN BULL OB" if "price_in_bull_ob" in df.columns and last.get("price_in_bull_ob") else ""
+        ob_bear    = "🔴 IN BEAR OB" if "price_in_bear_ob" in df.columns and last.get("price_in_bear_ob") else ""
+        ob_tag     = ob_bull or ob_bear or ""
+
         print(
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
             f"{ACTIVE_ASSET:<6} | "
-            f"Price: {float(last['close']):,.2f} | "
-            f"EMA Dist: {ema_dist:+.4f} | "
+            f"Price: {price:>10,.2f} | "
+            f"VWAP: {vwap:>10,.2f} ({vwap_side}) | "
             f"Signal: {signal:<8} | "
-            f"Label: {'✅ WIN' if label == 1 else '❌ LOSS'} | "
-            f"Balance: ${stats['balance']:,.2f} | "
-            f"WR: {stats['win_rate']}%"
+            f"Label: {'✅' if label == 1 else '❌'} | "
+            f"Bal: ${stats['balance']:,.2f} | "
+            f"WR: {stats['win_rate']}% "
+            f"{ob_tag}"
         )
 
         # ── SAVE TO AI DATA ───────────────────────────────
@@ -255,7 +285,6 @@ while True:
             "volatility":   round(vol,                  6),
             "label":        label
         }])
-
         new_row.to_csv(DATA_FILE, mode="a", header=False, index=False)
 
         time.sleep(60)

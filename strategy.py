@@ -1,21 +1,118 @@
 # strategy.py
-# KDM Trading System — Indicators + Signals + ICT Concepts
-# Includes: EMA, RSI, Session Filter, Fractal Sweep, CISD
+# KDM Trading System — VWAP + Order Block + ICT Concepts
+# Upgraded per Kapil: EMA replaced with VWAP, Order Block entries added
 
 import pandas as pd
 import numpy as np
 from datetime import time as dtime
 
 # =========================
-# ADD EMA INDICATORS
+# ADD INDICATORS
+# EMA kept for labeling/AI features
+# VWAP added as primary signal indicator
 # =========================
 def add_ema(df):
+    """
+    Adds VWAP, EMA (for AI features), RSI.
+    Function name kept as add_ema for backward compatibility
+    with main.py and train_ai.py imports.
+    """
     df = df.copy()
 
+    # ── VWAP (primary signal indicator) ───────────────
+    # VWAP = cumulative(price * volume) / cumulative(volume)
+    # Resets every session (daily)
+    df = calculate_vwap(df)
+
+    # ── EMA (kept for AI feature columns) ─────────────
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema15"] = df["close"].ewm(span=15, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["rsi"]   = calculate_rsi(df["close"], period=14)
+
+    # ── RSI ───────────────────────────────────────────
+    df["rsi"] = calculate_rsi(df["close"], period=14)
+
+    # ── VWAP DISTANCE (used as AI feature) ────────────
+    df["ema_distance"] = df["close"] - df["vwap"]   # price vs VWAP
+
+    return df
+
+
+# =========================
+# VWAP CALCULATION
+# =========================
+def calculate_vwap(df):
+    """
+    Calculates VWAP and VWAP bands.
+    Resets daily (uses date from timestamp if available).
+
+    Adds columns:
+        vwap        : main VWAP line
+        vwap_upper  : VWAP + 1 standard deviation (resistance)
+        vwap_lower  : VWAP - 1 standard deviation (support)
+        vwap_upper2 : VWAP + 2 standard deviations (extended resistance)
+        vwap_lower2 : VWAP - 2 standard deviations (extended support)
+    """
+    df = df.copy()
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+
+    # Try to reset VWAP by day
+    if "time" in df.columns:
+        try:
+            df["_date"] = pd.to_datetime(df["time"]).dt.date
+        except Exception:
+            df["_date"] = 0
+    else:
+        df["_date"] = 0
+
+    vwap_vals    = []
+    vwap_upper   = []
+    vwap_lower   = []
+    vwap_upper2  = []
+    vwap_lower2  = []
+
+    cum_tp_vol   = 0.0
+    cum_vol      = 0.0
+    cum_tp2_vol  = 0.0
+    prev_date    = None
+
+    for i in range(len(df)):
+        curr_date = df["_date"].iloc[i]
+
+        # Reset at start of each new day
+        if curr_date != prev_date:
+            cum_tp_vol  = 0.0
+            cum_vol     = 0.0
+            cum_tp2_vol = 0.0
+            prev_date   = curr_date
+
+        tp  = typical_price.iloc[i]
+        vol = df["volume"].iloc[i]
+        if vol == 0:
+            vol = 1
+
+        cum_tp_vol  += tp * vol
+        cum_vol     += vol
+        cum_tp2_vol += (tp ** 2) * vol
+
+        vwap = cum_tp_vol / cum_vol
+        variance = max(0, (cum_tp2_vol / cum_vol) - (vwap ** 2))
+        std  = variance ** 0.5
+
+        vwap_vals.append(vwap)
+        vwap_upper.append(vwap + std)
+        vwap_lower.append(vwap - std)
+        vwap_upper2.append(vwap + 2 * std)
+        vwap_lower2.append(vwap - 2 * std)
+
+    df["vwap"]       = vwap_vals
+    df["vwap_upper"] = vwap_upper
+    df["vwap_lower"] = vwap_lower
+    df["vwap_upper2"]= vwap_upper2
+    df["vwap_lower2"]= vwap_lower2
+
+    if "_date" in df.columns:
+        df = df.drop(columns=["_date"])
 
     return df
 
@@ -36,97 +133,145 @@ def calculate_rsi(series, period=14):
 # =========================
 # SESSION TIMING FILTER
 # =========================
-# ICT concept: only trade during high-probability sessions
-# London Open  : 02:00 – 05:00 EST  (best for GOLD)
-# NY Open      : 09:30 – 11:30 EST  (best for NASDAQ/NQ)
-# NY Afternoon : 13:30 – 16:00 EST  (secondary window)
-# Avoid        : 12:00 – 13:30 EST  (lunch chop)
-# Avoid        : 20:00 – 02:00 EST  (dead zone)
-
 SESSION_WINDOWS = {
     "BTC": [
-        (dtime(2,  0), dtime(5,  0)),    # London open
-        (dtime(9, 30), dtime(11, 30)),   # NY open
-        (dtime(13,30), dtime(16,  0)),   # NY afternoon
+        (dtime(2,  0), dtime(5,  0)),
+        (dtime(9, 30), dtime(11, 30)),
+        (dtime(13,30), dtime(16,  0)),
     ],
     "GOLD": [
-        (dtime(2,  0), dtime(5,  0)),    # London open — best for Gold
-        (dtime(9, 30), dtime(11, 30)),   # NY open
+        (dtime(2,  0), dtime(5,  0)),
+        (dtime(9, 30), dtime(11, 30)),
     ],
     "NASDAQ": [
-        (dtime(9, 30), dtime(11, 30)),   # NY open — primary NQ window
-        (dtime(13,30), dtime(15, 30)),   # NY afternoon
+        (dtime(9, 30), dtime(11, 30)),
+        (dtime(13,30), dtime(15, 30)),
     ],
 }
 
 def is_valid_session(timestamp, asset="BTC"):
-    """
-    Returns True if the candle timestamp falls inside a
-    high-probability trading session for the given asset.
-    Timestamps are converted to EST (UTC-5, no DST adjustment here).
-    """
     try:
-        if hasattr(timestamp, 'tz_localize'):
-            ts = timestamp
-        else:
-            ts = pd.Timestamp(timestamp)
-
-        # Convert to EST (UTC-5)
+        ts = pd.Timestamp(timestamp)
         if ts.tzinfo is not None:
             ts_est = ts.tz_convert("America/New_York")
         else:
             ts_est = ts - pd.Timedelta(hours=5)
-
         t = ts_est.time()
     except Exception:
-        return True   # if timestamp parsing fails, allow trade
+        return True
 
     windows = SESSION_WINDOWS.get(asset, SESSION_WINDOWS["BTC"])
     for start, end in windows:
         if start <= t <= end:
             return True
-
     return False
+
+
+# =========================
+# ORDER BLOCK DETECTION
+# =========================
+def detect_order_blocks(df, impulse_candles=3):
+    """
+    Detects bullish and bearish order blocks.
+
+    Bull OB : last bearish candle before a bullish impulse move
+              → price returns here to buy
+    Bear OB : last bullish candle before a bearish impulse move
+              → price returns here to sell
+
+    Adds columns:
+        ob_bull      : True if this candle is a bullish OB
+        ob_bear      : True if this candle is a bearish OB
+        ob_bull_high : top of bull OB zone
+        ob_bull_low  : bottom of bull OB zone
+        ob_bear_high : top of bear OB zone
+        ob_bear_low  : bottom of bear OB zone
+        price_in_bull_ob : True if current price is inside any recent bull OB
+        price_in_bear_ob : True if current price is inside any recent bear OB
+    """
+    df = df.copy()
+    df["ob_bull"]          = False
+    df["ob_bear"]          = False
+    df["ob_bull_high"]     = np.nan
+    df["ob_bull_low"]      = np.nan
+    df["ob_bear_high"]     = np.nan
+    df["ob_bear_low"]      = np.nan
+    df["price_in_bull_ob"] = False
+    df["price_in_bear_ob"] = False
+
+    bull_obs = []   # list of (high, low) for active bull OBs
+    bear_obs = []   # list of (high, low) for active bear OBs
+
+    for i in range(impulse_candles + 1, len(df)):
+        future = df.iloc[i + 1 : i + 1 + impulse_candles]
+        if len(future) < impulse_candles:
+            continue
+
+        curr_bearish = df["close"].iloc[i] < df["open"].iloc[i]
+        curr_bullish = df["close"].iloc[i] > df["open"].iloc[i]
+
+        # Bull OB: bearish candle → strong bullish impulse after
+        if curr_bearish:
+            impulse_up = all(
+                future["close"].iloc[j] > future["open"].iloc[j]
+                for j in range(len(future))
+            )
+            if impulse_up:
+                ob_high = df["open"].iloc[i]
+                ob_low  = df["close"].iloc[i]
+                df.at[df.index[i], "ob_bull"]      = True
+                df.at[df.index[i], "ob_bull_high"] = ob_high
+                df.at[df.index[i], "ob_bull_low"]  = ob_low
+                bull_obs.append((ob_high, ob_low))
+
+        # Bear OB: bullish candle → strong bearish impulse after
+        if curr_bullish:
+            impulse_down = all(
+                future["close"].iloc[j] < future["open"].iloc[j]
+                for j in range(len(future))
+            )
+            if impulse_down:
+                ob_high = df["close"].iloc[i]
+                ob_low  = df["open"].iloc[i]
+                df.at[df.index[i], "ob_bear"]      = True
+                df.at[df.index[i], "ob_bear_high"] = ob_high
+                df.at[df.index[i], "ob_bear_low"]  = ob_low
+                bear_obs.append((ob_high, ob_low))
+
+        # Check if current price is inside any recent OB (last 20)
+        curr_close = df["close"].iloc[i]
+        recent_bull_obs = bull_obs[-20:]
+        recent_bear_obs = bear_obs[-20:]
+
+        in_bull = any(ob_low <= curr_close <= ob_high for ob_high, ob_low in recent_bull_obs)
+        in_bear = any(ob_low <= curr_close <= ob_high for ob_high, ob_low in recent_bear_obs)
+
+        df.at[df.index[i], "price_in_bull_ob"] = in_bull
+        df.at[df.index[i], "price_in_bear_ob"] = in_bear
+
+    return df
 
 
 # =========================
 # FRACTAL SWEEP DETECTION
 # =========================
-# ICT concept: price sweeps a prior swing high/low (takes liquidity)
-# then reverses — this is a high-probability entry trigger.
-#
-# Bullish sweep : price wicks BELOW a prior swing low then closes above it
-# Bearish sweep : price wicks ABOVE a prior swing high then closes below it
-
 def detect_fractal_sweep(df, lookback=10):
-    """
-    Adds columns:
-        sweep_bull  : True if current candle swept a prior low and reversed
-        sweep_bear  : True if current candle swept a prior high and reversed
-        sweep_level : the price level that was swept
-    """
     df = df.copy()
     df["sweep_bull"]  = False
     df["sweep_bear"]  = False
     df["sweep_level"] = np.nan
 
     for i in range(lookback + 1, len(df)):
-        window = df.iloc[i - lookback : i]
-
+        window     = df.iloc[i - lookback : i]
         prior_low  = window["low"].min()
         prior_high = window["high"].max()
-
         curr_low   = df["low"].iloc[i]
         curr_high  = df["high"].iloc[i]
         curr_close = df["close"].iloc[i]
-        curr_open  = df["open"].iloc[i]
 
-        # Bullish sweep: wick below prior low but close ABOVE it
         if curr_low < prior_low and curr_close > prior_low:
             df.at[df.index[i], "sweep_bull"]  = True
             df.at[df.index[i], "sweep_level"] = prior_low
-
-        # Bearish sweep: wick above prior high but close BELOW it
         elif curr_high > prior_high and curr_close < prior_high:
             df.at[df.index[i], "sweep_bear"]  = True
             df.at[df.index[i], "sweep_level"] = prior_high
@@ -135,21 +280,9 @@ def detect_fractal_sweep(df, lookback=10):
 
 
 # =========================
-# CISD DETECTION (Python)
+# CISD DETECTION
 # =========================
-# Change in State of Delivery — translated from the PineScript indicator.
-# Bullish CISD : prior candle was bearish, current candle is bullish
-#                AND current close breaks above the prior candle's open
-# Bearish CISD : prior candle was bullish, current candle is bearish
-#                AND current close breaks below the prior candle's open
-
 def detect_cisd(df):
-    """
-    Adds columns:
-        cisd_bull  : bullish change in delivery
-        cisd_bear  : bearish change in delivery
-        cisd_level : the open price of the prior candle (the key level)
-    """
     df = df.copy()
     df["cisd_bull"]  = False
     df["cisd_bear"]  = False
@@ -161,19 +294,14 @@ def detect_cisd(df):
         curr_open  = df["open"].iloc[i]
         curr_close = df["close"].iloc[i]
 
-        prev_bullish = prev_close > prev_open
         prev_bearish = prev_close < prev_open
+        prev_bullish = prev_close > prev_open
         curr_bullish = curr_close > curr_open
         curr_bearish = curr_close < curr_open
 
-        # Bullish CISD: prior candle bearish, current bullish,
-        # current close breaks ABOVE prior candle open
         if prev_bearish and curr_bullish and curr_close > prev_open:
             df.at[df.index[i], "cisd_bull"]  = True
             df.at[df.index[i], "cisd_level"] = prev_open
-
-        # Bearish CISD: prior candle bullish, current bearish,
-        # current close breaks BELOW prior candle open
         elif prev_bullish and curr_bearish and curr_close < prev_open:
             df.at[df.index[i], "cisd_bear"]  = True
             df.at[df.index[i], "cisd_level"] = prev_open
@@ -182,71 +310,27 @@ def detect_cisd(df):
 
 
 # =========================
-# ORDER BLOCK DETECTION
-# =========================
-# ICT concept: last bearish candle before a bullish impulse (bull OB)
-# or last bullish candle before a bearish impulse (bear OB).
-# Price often returns to these zones for high-probability entries.
-
-def detect_order_blocks(df, impulse_candles=3):
-    """
-    Adds columns:
-        ob_bull      : True if this candle is a bullish order block
-        ob_bear      : True if this candle is a bearish order block
-        ob_bull_high : top of bullish OB zone
-        ob_bull_low  : bottom of bullish OB zone
-        ob_bear_high : top of bearish OB zone
-        ob_bear_low  : bottom of bearish OB zone
-    """
-    df = df.copy()
-    df["ob_bull"]      = False
-    df["ob_bear"]      = False
-    df["ob_bull_high"] = np.nan
-    df["ob_bull_low"]  = np.nan
-    df["ob_bear_high"] = np.nan
-    df["ob_bear_low"]  = np.nan
-
-    for i in range(impulse_candles + 1, len(df)):
-        # Check for bullish impulse move after this candle
-        future = df.iloc[i + 1 : i + 1 + impulse_candles]
-        if len(future) < impulse_candles:
-            continue
-
-        curr_bearish = df["close"].iloc[i] < df["open"].iloc[i]
-        curr_bullish = df["close"].iloc[i] > df["open"].iloc[i]
-
-        # Bull OB: bearish candle followed by strong bullish impulse
-        if curr_bearish:
-            impulse_up = all(
-                future["close"].iloc[j] > future["open"].iloc[j]
-                for j in range(len(future))
-            )
-            if impulse_up:
-                df.at[df.index[i], "ob_bull"]      = True
-                df.at[df.index[i], "ob_bull_high"] = df["open"].iloc[i]
-                df.at[df.index[i], "ob_bull_low"]  = df["close"].iloc[i]
-
-        # Bear OB: bullish candle followed by strong bearish impulse
-        if curr_bullish:
-            impulse_down = all(
-                future["close"].iloc[j] < future["open"].iloc[j]
-                for j in range(len(future))
-            )
-            if impulse_down:
-                df.at[df.index[i], "ob_bear"]      = True
-                df.at[df.index[i], "ob_bear_high"] = df["close"].iloc[i]
-                df.at[df.index[i], "ob_bear_low"]  = df["open"].iloc[i]
-
-    return df
-
-
-# =========================
-# GENERATE SIGNAL (full ICT filter)
+# GENERATE SIGNAL
+# Primary: VWAP + Order Block
+# Confirmation: RSI + Session + Sweep + CISD
 # =========================
 def generate_signal(df, asset="BTC", use_session_filter=True):
     """
-    Full signal with EMA crossover + RSI + trend + session + sweep + CISD.
-    Returns: "BUY", "SELL", or "NO TRADE"
+    VWAP + Order Block signal logic:
+
+    BUY  conditions:
+      1. Price crosses above VWAP  (momentum entry)
+      OR
+      2. Price pulls back into Bull Order Block near VWAP  (OB entry)
+      + RSI confirmation
+      + Session filter
+
+    SELL conditions:
+      1. Price crosses below VWAP
+      OR
+      2. Price pulls back into Bear Order Block near VWAP
+      + RSI confirmation
+      + Session filter
     """
     if len(df) < 50:
         return "NO TRADE"
@@ -258,51 +342,76 @@ def generate_signal(df, asset="BTC", use_session_filter=True):
             if not is_valid_session(last_time, asset):
                 return "NO TRADE"
         except Exception:
-            pass   # if time column missing, skip session filter
+            pass
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # ── EMA CROSSOVER ─────────────────────────────────
-    ema_cross_up   = prev["ema9"] < prev["ema15"] and last["ema9"] > last["ema15"]
-    ema_cross_down = prev["ema9"] > prev["ema15"] and last["ema9"] < last["ema15"]
+    curr_close = last["close"]
+    curr_rsi   = last["rsi"]
+    curr_vwap  = last["vwap"]
 
-    # ── TREND FILTER ──────────────────────────────────
-    above_trend = last["close"] > last["ema50"]
-    below_trend = last["close"] < last["ema50"]
+    # ── VWAP CROSS ────────────────────────────────────
+    # Bullish cross: price was below VWAP, now above
+    vwap_cross_up   = prev["close"] < prev["vwap"] and curr_close > curr_vwap
+    # Bearish cross: price was above VWAP, now below
+    vwap_cross_down = prev["close"] > prev["vwap"] and curr_close < curr_vwap
+
+    # ── VWAP POSITION ─────────────────────────────────
+    above_vwap = curr_close > curr_vwap
+    below_vwap = curr_close < curr_vwap
+
+    # ── ORDER BLOCK CHECK ─────────────────────────────
+    in_bull_ob = "price_in_bull_ob" in df.columns and last["price_in_bull_ob"]
+    in_bear_ob = "price_in_bear_ob" in df.columns and last["price_in_bear_ob"]
 
     # ── RSI FILTER ────────────────────────────────────
-    rsi_buy_ok  = 45 < last["rsi"] < 65
-    rsi_sell_ok = 35 < last["rsi"] < 55
-
-    # ── EMA GAP (no noise crossovers) ─────────────────
-    gap_pct = abs(last["ema9"] - last["ema15"]) / last["close"]
-    gap_ok  = gap_pct > 0.0002
+    rsi_buy_ok  = 35 < curr_rsi < 75
+    rsi_sell_ok = 25 < curr_rsi < 65
 
     # ── ICT CONFIRMATIONS ─────────────────────────────
-    # Check last 3 candles for sweep/CISD confirmation
-    recent = df.tail(3)
-
+    recent         = df.tail(3)
     has_bull_sweep = "sweep_bull" in df.columns and recent["sweep_bull"].any()
     has_bear_sweep = "sweep_bear" in df.columns and recent["sweep_bear"].any()
     has_cisd_bull  = "cisd_bull"  in df.columns and recent["cisd_bull"].any()
     has_cisd_bear  = "cisd_bear"  in df.columns and recent["cisd_bear"].any()
 
-    # ICT confirmation bonus — if present, relax RSI slightly
-    ict_bull_confirm = has_bull_sweep or has_cisd_bull
-    ict_bear_confirm = has_bear_sweep or has_cisd_bear
+    ict_bull = has_bull_sweep or has_cisd_bull
+    ict_bear = has_bear_sweep or has_cisd_bear
 
-    if ict_bull_confirm:
-        rsi_buy_ok = 40 < last["rsi"] < 70
-    if ict_bear_confirm:
-        rsi_sell_ok = 30 < last["rsi"] < 60
+    if ict_bull:
+        rsi_buy_ok = 30 < curr_rsi < 80
+    if ict_bear:
+        rsi_sell_ok = 20 < curr_rsi < 70
 
-    # ── BUY ───────────────────────────────────────────
-    if ema_cross_up and above_trend and rsi_buy_ok and gap_ok:
+    # ── BUY SIGNALS ───────────────────────────────────
+
+    # Signal 1: VWAP crossover up
+    if vwap_cross_up and rsi_buy_ok:
         return "BUY"
 
-    # ── SELL ──────────────────────────────────────────
-    if ema_cross_down and below_trend and rsi_sell_ok and gap_ok:
+    # Signal 2: Price in Bull Order Block + above VWAP + ICT confirm
+    if in_bull_ob and above_vwap and rsi_buy_ok and ict_bull:
+        return "BUY"
+
+    # Signal 3: Bull OB + VWAP support (price near VWAP from above)
+    vwap_dist_pct = (curr_close - curr_vwap) / curr_vwap
+    near_vwap     = abs(vwap_dist_pct) < 0.001     # within 0.1% of VWAP
+    if in_bull_ob and near_vwap and rsi_buy_ok:
+        return "BUY"
+
+    # ── SELL SIGNALS ──────────────────────────────────
+
+    # Signal 1: VWAP crossover down
+    if vwap_cross_down and rsi_sell_ok:
+        return "SELL"
+
+    # Signal 2: Price in Bear Order Block + below VWAP + ICT confirm
+    if in_bear_ob and below_vwap and rsi_sell_ok and ict_bear:
+        return "SELL"
+
+    # Signal 3: Bear OB + VWAP resistance (price near VWAP from below)
+    if in_bear_ob and near_vwap and rsi_sell_ok:
         return "SELL"
 
     return "NO TRADE"
@@ -315,8 +424,8 @@ def label_candles(df, tp_pct=0.002, sl_pct=0.002, lookahead=30):
     """
     Forward-looking labels based on TP/SL outcome.
     label = 1  → TP hit first (win)
-    label = 0  → SL hit first or neither (loss/skip)
-    label = -1 → not enough future candles (drop these rows)
+    label = 0  → SL hit first or neither (loss)
+    label = -1 → not enough future candles (drop)
     """
     labels = []
 
