@@ -53,7 +53,7 @@ ASSETS = {
 # Set to True  → only signals during market hours
 # Set to False → signals 24/7 (good for testing)
 # =========================
-USE_SESSION_FILTER = False    # ← change to True for live prop trading
+USE_SESSION_FILTER = True     # ← change to True for live prop trading
 
 # =========================
 # SWITCH ASSET FROM TERMINAL

@@ -11,8 +11,7 @@ from datetime import datetime
 # =========================
 # TRADING MODE
 # =========================
-REAL_TRADING = False      # ← change to True when ready for real/prop trading
-
+REAL_TRADING = False      # ← change to True when ready for real
 # =========================
 # PROP FIRM CONFIG
 # NQ Futures rules (adjust to match your Lucid account rules)
