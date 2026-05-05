@@ -1,0 +1,24 @@
+# Model files (too large)
+*.pkl
+
+# Sensitive state
+bot_state.json
+config_secret.py
+
+# Data files (regenerated locally)
+ai_data_btc.csv
+ai_data_gold.csv
+ai_data_nasdaq.csv
+ai_data.csv
+trade_log.csv
+trades.csv
+backtest_results.csv
+backtest_nq_results.csv
+
+# Large historical data
+*.ohlcv-1m.csv
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
